@@ -712,3 +712,238 @@ def test_contingency_minimum_run_with_batch_lattice():
     assert cont.status == "optimal"
     assert cont.volumes == pytest.approx([500.0, 0.0], abs=1e-6)
     assert cont.deltas == pytest.approx([300.0, -300.0], abs=1e-6)
+
+# --------------------------------------------------------------------------- #
+# price_tiers (tiered pricing) semantics
+# --------------------------------------------------------------------------- #
+
+def tiered(id, max_volume, tiers, ca=50.0, mg=10.0, alk=100.0, batch_size=None,
+           minimum_run_volume=None):
+    return SourceData(
+        id=id, max_volume=max_volume, cost=None,
+        calcium=ca, magnesium=mg, alkalinity=alk,
+        batch_size=batch_size, minimum_run_volume=minimum_run_volume,
+        price_tiers=list(tiers),
+    )
+
+
+def test_price_tiers_consumed_in_order_with_decreasing_prices():
+    # A's second tier is cheaper than its first (2.0 -> 0.5).  Without the
+    # in-order constraints an LP would pour everything into the cheap second
+    # tier (cost 75); the MIP must fill tier 1 first, so 150 m3 from A cost
+    # 100*2 + 50*0.5 = 225 — still better than flat B at 3.0.
+    sources = [
+        tiered("A", 200, [(100.0, 2.0), (None, 0.5)]),
+        src("B", 200, 3.0),
+    ]
+    out = solve_blend(sources, 150, {})
+    assert out.status == "optimal"
+    assert out.volumes == pytest.approx([150.0, 0.0], abs=1e-5)
+    assert out.total_cost == pytest.approx(225.0, abs=1e-5)
+    assert out.tier_volumes[0] == pytest.approx([100.0, 50.0], abs=1e-5)
+    assert out.tier_volumes[1] is None
+    assert out.source_costs == pytest.approx([225.0, 0.0], abs=1e-5)
+
+
+def test_price_tiers_replace_flat_cost():
+    # Increasing prices 1.0 -> 4.0: tier 1 is the cheapest water overall,
+    # tier 2 the most expensive, flat B (2.0) sits in between.
+    sources = [
+        tiered("A", 300, [(100.0, 1.0), (None, 4.0)]),
+        src("B", 300, 2.0),
+    ]
+    out = solve_blend(sources, 250, {})
+    assert out.status == "optimal"
+    assert out.volumes == pytest.approx([100.0, 150.0], abs=1e-5)
+    assert out.total_cost == pytest.approx(400.0, abs=1e-5)
+    assert out.tier_volumes[0] == pytest.approx([100.0, 0.0], abs=1e-5)
+
+
+def test_price_tiers_open_last_tier_covers_max_volume():
+    # The null-capacity last tier extends up to max_volume (250): A can be
+    # drained completely, 100*1 + 150*2 = 400, beating any use of B at 5.0.
+    sources = [
+        tiered("A", 250, [(100.0, 1.0), (None, 2.0)]),
+        src("B", 300, 5.0),
+    ]
+    out = solve_blend(sources, 250, {})
+    assert out.status == "optimal"
+    assert out.volumes == pytest.approx([250.0, 0.0], abs=1e-5)
+    assert out.total_cost == pytest.approx(400.0, abs=1e-5)
+    assert out.tier_volumes[0] == pytest.approx([100.0, 150.0], abs=1e-5)
+
+
+def test_price_tiers_single_open_tier_matches_flat_cost():
+    tiered_out = solve_blend(
+        [tiered("A", 100, [(None, 2.0)]), src("B", 200, 3.0)], 150, {}
+    )
+    flat_out = solve_blend([src("A", 100, 2.0), src("B", 200, 3.0)], 150, {})
+    assert tiered_out.status == "optimal"
+    assert tiered_out.volumes == pytest.approx(flat_out.volumes, abs=1e-6)
+    assert tiered_out.total_cost == pytest.approx(350.0, abs=1e-5)
+    assert tiered_out.tier_volumes[0] == pytest.approx([100.0], abs=1e-5)
+
+
+def test_price_tiers_with_batch_size():
+    # A delivers 100 m3 batches (z in {0,1,2,3}) priced 1.0 up to 150 m3 and
+    # 2.0 beyond.  V=250: A=200 (150@1 + 50@2 = 250) plus B=50 (250) is the
+    # joint MIP optimum at cost 500 — batch lattice and tier order hold
+    # simultaneously.
+    sources = [
+        tiered("A", 300, [(150.0, 1.0), (None, 2.0)], batch_size=100.0),
+        src("B", 500, 5.0),
+    ]
+    out = solve_blend(sources, 250, {})
+    assert out.status == "optimal"
+    assert out.volumes == pytest.approx([200.0, 50.0], abs=1e-5)
+    assert out.total_cost == pytest.approx(500.0, abs=1e-5)
+    assert out.tier_volumes[0] == pytest.approx([150.0, 50.0], abs=1e-5)
+
+
+def test_price_tiers_with_minimum_run_volume():
+    # A runs only at 0 or >= 200; enabled it costs 1.0 up to 200 then 3.0.
+    # V=300: A=200 (200) + B=100 (200) = 400 beats A=300 (500) and B-only
+    # (600).
+    sources = [
+        tiered("A", 400, [(200.0, 1.0), (None, 3.0)], minimum_run_volume=200.0),
+        src("B", 500, 2.0),
+    ]
+    out = solve_blend(sources, 300, {})
+    assert out.status == "optimal"
+    assert out.volumes == pytest.approx([200.0, 100.0], abs=1e-5)
+    assert out.total_cost == pytest.approx(400.0, abs=1e-5)
+    assert out.tier_volumes[0] == pytest.approx([200.0, 0.0], abs=1e-5)
+
+
+def test_price_tiers_with_minimum_active_sources():
+    # K=2 forces both threshold sources on (A >= 100, B >= 100); C never
+    # counts.  Cost of A beyond tier 1 is 2.0 vs B's flat 1.5, so the MIP
+    # keeps A at its tier-1 boundary and lets B take the rest.
+    sources = [
+        tiered("A", 400, [(100.0, 1.0), (None, 2.0)], minimum_run_volume=100.0),
+        src("B", 400, 1.5, minimum_run_volume=100.0),
+        src("C", 400, 5.0),
+    ]
+    out = solve_blend(sources, 300, {}, minimum_active_sources=2)
+    assert out.status == "optimal"
+    assert out.volumes == pytest.approx([100.0, 200.0, 0.0], abs=1e-5)
+    assert out.total_cost == pytest.approx(400.0, abs=1e-5)
+    assert out.tier_volumes[0] == pytest.approx([100.0, 0.0], abs=1e-5)
+
+
+def test_price_tiers_with_quality_window():
+    # A ca 100 priced 1.0 -> 3.0 at 100 m3, B ca 20 flat 2.0; V=200, calcium
+    # window [40, 60] forces A <= 100, so A stays inside its cheap tier.
+    sources = [
+        tiered("A", 200, [(100.0, 1.0), (None, 3.0)], ca=100.0),
+        src("B", 300, 2.0, ca=20.0),
+    ]
+    out = solve_blend(sources, 200, {"calcium": (40.0, 60.0)})
+    assert out.status == "optimal"
+    assert out.volumes == pytest.approx([100.0, 100.0], abs=1e-5)
+    assert out.total_cost == pytest.approx(300.0, abs=1e-5)
+    assert out.indicators["calcium"] == pytest.approx(60.0, abs=1e-5)
+
+
+def test_price_tiers_lexicographic_tie_break():
+    # Identical tiered sources; V=150.  Every split with both usages <= 100
+    # costs 150, so the tie is broken on the id-sorted usage vector:
+    # A=50, B=100.
+    sources = [
+        tiered("A", 200, [(100.0, 1.0), (None, 2.0)]),
+        tiered("B", 200, [(100.0, 1.0), (None, 2.0)]),
+    ]
+    out = solve_blend(sources, 150, {})
+    assert out.status == "optimal"
+    assert out.volumes == pytest.approx([50.0, 100.0], abs=1e-5)
+    assert out.total_cost == pytest.approx(150.0, abs=1e-5)
+    assert out.tier_volumes[0] == pytest.approx([50.0, 0.0], abs=1e-5)
+    assert out.tier_volumes[1] == pytest.approx([100.0, 0.0], abs=1e-5)
+
+
+def test_price_tiers_infeasible_ranges_use_same_feasible_set():
+    # A ca 100 tiered cap 100, B ca 20 cap 100, V=150: the best calcium is
+    # (100*100 + 50*20)/150 = 73.33, so a 75 minimum is infeasible and the
+    # reported range comes from the same tier-constrained MIP.
+    sources = [
+        tiered("A", 100, [(50.0, 1.0), (None, 2.0)], ca=100.0),
+        src("B", 100, 3.0, ca=20.0),
+    ]
+    out = solve_blend(sources, 150, {"calcium": (75.0, 90.0)})
+    assert out.status == "infeasible"
+    ca = out.achievable_ranges["calcium"]
+    assert ca["max"] == pytest.approx(73.333333, abs=1e-4)
+    assert "calcium" in out.message
+
+    short = solve_blend(sources, 300, {})
+    assert short.status == "infeasible"
+    assert short.achievable_ranges["volume"]["max"] == pytest.approx(200.0)
+
+
+def test_price_tiers_contingency_preserves_tiers():
+    # Original plan drains A (300@1 + 200@2 = 700).  Cutting A to 400 moves
+    # 100 m3 to B; the new cost prices A's tiers again (300@1 + 100@2 = 500)
+    # plus B=100 at 3.0 -> 800, a delta of +100.
+    sources = [
+        tiered("A", 500, [(300.0, 1.0), (None, 2.0)]),
+        src("B", 1000, 3.0),
+    ]
+    out = solve_blend(sources, 500, {})
+    assert out.status == "optimal"
+    assert out.volumes == pytest.approx([500.0, 0.0], abs=1e-5)
+    assert out.total_cost == pytest.approx(700.0, abs=1e-5)
+
+    cont = solve_contingency(
+        sources, 500, {}, {"A": 500.0, "B": 0.0}, {"A": 400.0}
+    )
+    assert cont.status == "optimal"
+    assert cont.volumes == pytest.approx([400.0, 100.0], abs=1e-5)
+    assert cont.total_adjustment == pytest.approx(200.0, abs=1e-5)
+    assert cont.total_cost == pytest.approx(800.0, abs=1e-5)
+    assert cont.cost_delta == pytest.approx(100.0, abs=1e-5)
+    assert cont.tier_volumes[0] == pytest.approx([300.0, 100.0], abs=1e-5)
+    assert cont.tier_volumes[1] is None
+
+
+def test_price_tiers_contingency_cap_below_first_tier():
+    # A's new cap (200) cuts into its first tier (300): the contingency
+    # re-prices the reduced usage entirely inside tier 1.
+    sources = [
+        tiered("A", 500, [(300.0, 1.0), (None, 2.0)]),
+        src("B", 1000, 3.0),
+    ]
+    cont = solve_contingency(
+        sources, 500, {}, {"A": 500.0, "B": 0.0}, {"A": 200.0}
+    )
+    assert cont.status == "optimal"
+    assert cont.volumes == pytest.approx([200.0, 300.0], abs=1e-5)
+    assert cont.total_cost == pytest.approx(1100.0, abs=1e-5)
+    assert cont.tier_volumes[0] == pytest.approx([200.0, 0.0], abs=1e-5)
+
+
+def test_price_tiers_minimum_run_lands_mid_tier():
+    # Threshold 150 exceeds tier 1 (100): enabling A means drawing 50 m3
+    # from the expensive second tier; the MIP weighs exactly that cost.
+    sources = [
+        tiered("A", 400, [(100.0, 1.0), (None, 3.0)], minimum_run_volume=150.0),
+        src("B", 500, 2.5),
+    ]
+    out = solve_blend(sources, 200, {})
+    assert out.status == "optimal"
+    assert out.volumes == pytest.approx([150.0, 50.0], abs=1e-5)
+    assert out.total_cost == pytest.approx(375.0, abs=1e-5)
+    assert out.tier_volumes[0] == pytest.approx([100.0, 50.0], abs=1e-5)
+
+
+def test_price_tiers_batched_contingency_infeasible():
+    # A and B both batch 300 with A tiered; cutting B to 200 floors it to
+    # zero batches, leaving at most 600 on the lattice -> infeasible.
+    sources = [
+        tiered("A", 600, [(300.0, 1.0), (None, 2.0)], batch_size=300.0),
+        src("B", 900, 2.0, batch_size=300.0),
+    ]
+    cont = solve_contingency(
+        sources, 900, {}, {"A": 300.0, "B": 600.0}, {"B": 200.0}
+    )
+    assert cont.status == "infeasible"
+    assert cont.achievable_ranges["volume"]["max"] == pytest.approx(600.0, abs=1e-6)

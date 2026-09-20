@@ -22,6 +22,7 @@ from .models import (
     InfeasiblePlan,
     OptimalPlan,
     PlanCreateRequest,
+    TierAllocation,
 )
 from .solver import INDICATORS, SourceData, solve_blend, solve_contingency
 
@@ -107,6 +108,11 @@ def _source_data(req: BlendRequest) -> List[SourceData]:
                 alkalinity=s.alkalinity,
                 batch_size=s.batch_size,
                 minimum_run_volume=s.minimum_run_volume,
+                price_tiers=(
+                    [(t.capacity, t.unit_price) for t in s.price_tiers]
+                    if s.price_tiers is not None
+                    else None
+                ),
             )
             for s in req.sources
         ),
@@ -136,6 +142,24 @@ def _solve(req: BlendRequest) -> Tuple[List[SourceData], Any]:
     return sources, result
 
 
+def _tier_allocations(
+    source: SourceData, tier_volumes: Optional[List[float]]
+) -> Optional[List[TierAllocation]]:
+    """Per-tier usage/cost breakdown; None for flat-cost sources."""
+    if tier_volumes is None:
+        return None
+    return [
+        TierAllocation(
+            tier=k + 1,
+            capacity=source.price_tiers[k][0],
+            unit_price=source.price_tiers[k][1],
+            volume=float(v),
+            cost=float(v) * source.price_tiers[k][1],
+        )
+        for k, v in enumerate(tier_volumes)
+    ]
+
+
 def _build_body(sources, req: BlendRequest, result, plan_id, created_at) -> Dict[str, Any]:
     if result.status == "optimal":
         body = OptimalPlan(
@@ -144,8 +168,15 @@ def _build_body(sources, req: BlendRequest, result, plan_id, created_at) -> Dict
             total_volume=req.target_volume,
             total_cost=result.total_cost,
             blend=[
-                Allocation(source_id=s.id, volume=v, cost=v * s.cost)
-                for s, v in zip(sources, result.volumes)
+                Allocation(
+                    source_id=s.id,
+                    volume=float(v),
+                    cost=float(result.source_costs[i]),
+                    tiers=_tier_allocations(
+                        s, result.tier_volumes[i] if result.tier_volumes else None
+                    ),
+                )
+                for i, (s, v) in enumerate(zip(sources, result.volumes))
             ],
             indicators=result.indicators,
         )
@@ -181,9 +212,12 @@ def _contingency_body(
                     "new_volume": float(v),
                     "volume_delta": float(v - original[s.id]),
                     "new_cap": float(new_caps.get(s.id, s.max_volume)),
-                    "cost": float(v * s.cost),
+                    "cost": float(result.source_costs[i]),
+                    "tiers": _tier_allocations(
+                        s, result.tier_volumes[i] if result.tier_volumes else None
+                    ),
                 }
-                for s, v in zip(sources, result.volumes)
+                for i, (s, v) in enumerate(zip(sources, result.volumes))
             ],
             indicators=result.indicators,
         )
@@ -307,11 +341,11 @@ def plan_contingency(plan_id: int, reductions: Dict[str, float]) -> JSONResponse
     ``0 <= new_cap <= original max_volume``, and sources not listed keep
     their original cap.  The target volume, indicator windows, water
     quality (source concentrations) and costs are taken from the stored
-    request.  Batch sizes, minimum-run thresholds and minimum_active_sources
-    are likewise preserved.  Among feasible allocations the service first
-    minimizes the total absolute volume change versus the saved blend, then
-    the total cost, and finally takes the id-sorted usage-vector
-    lexicographic minimum.
+    request.  Batch sizes, minimum-run thresholds, minimum_active_sources
+    and price tiers are likewise preserved.  Among feasible allocations
+    the service first minimizes the total absolute volume change versus
+    the saved blend, then the total cost, and finally takes the id-sorted
+    usage-vector lexicographic minimum.
 
     The contingency result is neither saved nor does it modify the
     original plan.  Infeasibility under the new caps is reported with

@@ -19,13 +19,27 @@ sources are coupled by
 
     sum(y_i) >= K.
 
-    minimize    sum(cost_i * x_i)
+A source may replace its flat ``cost`` with ``price_tiers``: an ordered list
+of (capacity, unit price) segments whose capacities cover ``max_volume``
+(the last segment may be open-ended).  Tier-usage variables t_{i,k} sum to
+the source volume and are consumed in order — one binary variable per tier
+boundary enforces
+
+    t_{i,k} <= c_{i,k} * w_{i,k}          (tier k closed while w = 0)
+    t_{i,k-1} >= c_{i,k-1} * w_{i,k}      (tier k opens only once k-1 is full)
+
+so the source cost is the piecewise-linear sum of its tier prices, minimized
+in the same MIP together with the batch, commissioning and quality
+constraints.
+
+    minimize    sum(cost_i * x_i)  (flat sources) + sum(price_ik * t_ik)  (tiered)
     subject to  sum(x_i)                       = target_volume
                 lo_j * target_volume <= sum(conc_ij * x_i) <= hi_j * target_volume
                 x_i                            <= max_volume_i
                 z_i in Z>=0 for batched sources, z_i in R>=0 otherwise
                 x_i in {0} or [m_i, U_i] for threshold sources (via y_i)
                 sum(y_i) >= K when minimum_active_sources is set
+                sum_k t_{i,k} = x_i and in-order tier usage (via w_ik)
 
 Continuous, batched and commissioned sources are solved together in a single
 mixed-integer program; a continuous optimum is never rounded or trimmed
@@ -67,12 +81,15 @@ _COST_RTOL = 1e-9
 class SourceData:
     id: str
     max_volume: float
-    cost: float
+    cost: Optional[float]
     calcium: float
     magnesium: float
     alkalinity: float
     batch_size: Optional[float] = None
     minimum_run_volume: Optional[float] = None
+    # Ordered (capacity, unit_price) segments replacing the flat cost; a
+    # null capacity on the last segment extends it up to max_volume.
+    price_tiers: Optional[List[Tuple[Optional[float], float]]] = None
 
 
 @dataclass
@@ -82,13 +99,15 @@ class _Model:
     Volumes are recovered as ``x = scales * z`` for the first ``n`` columns;
     ``integrality`` marks the batch-count variables and the binary enable
     variables.  Columns ``n`` onward hold one binary enable variable per
-    threshold source, in id-sorted order (see ``y_col``).
+    threshold source, in id-sorted order (see ``y_col``), then the
+    tier-usage columns ``t_{i,k}`` (continuous, see ``tier_cols``) and one
+    binary tier-boundary variable per tier beyond the first.
 
     ``A_struct``/``b_struct`` hold the commissioning (minimum-run and active-
-    count) constraints, which are part of *every* projection of the feasible
-    set, including the indicator-free infeasibility analysis.  ``A_ub``/
-    ``b_ub`` hold the indicator windows, which that analysis deliberately
-    drops.
+    count) constraints and the tier-ordering constraints, which are part of
+    *every* projection of the feasible set, including the indicator-free
+    infeasibility analysis.  ``A_ub``/``b_ub`` hold the indicator windows,
+    which that analysis deliberately drops.
     """
 
     n: int
@@ -106,6 +125,9 @@ class _Model:
     threshold: np.ndarray        # bool per source: declares minimum_run_volume
     minimum_active: int          # required active threshold sources (>= 0)
     minimum_run: np.ndarray      # minimum-run volume per source (0 if unset)
+    tier_cols: Dict[int, List[int]]      # source index -> tier-usage columns
+    tier_caps: Dict[int, List[float]]    # source index -> effective tier caps
+    tier_prices: Dict[int, List[float]]  # source index -> tier unit prices
 
 
 @dataclass
@@ -113,6 +135,9 @@ class SolveOutput:
     status: str  # "optimal" | "infeasible"
     volumes: Optional[np.ndarray] = None       # aligned with the sorted sources
     total_cost: Optional[float] = None
+    source_costs: Optional[np.ndarray] = None  # per-source cost, sorted order
+    # per source (sorted order): tier usages, or None for flat-cost sources
+    tier_volumes: Optional[List[Optional[List[float]]]] = None
     indicators: Optional[Dict[str, float]] = None
     achievable_ranges: Optional[Dict[str, dict]] = None
     message: Optional[str] = None
@@ -128,6 +153,8 @@ class ContingencyOutput:
     total_adjustment: Optional[float] = None   # sum of absolute deltas
     total_cost: Optional[float] = None
     cost_delta: Optional[float] = None         # new cost - original cost
+    source_costs: Optional[np.ndarray] = None  # per-source cost, sorted order
+    tier_volumes: Optional[List[Optional[List[float]]]] = None
     indicators: Optional[Dict[str, float]] = None
     achievable_ranges: Optional[Dict[str, dict]] = None
     message: Optional[str] = None
@@ -160,6 +187,75 @@ def _minimum_run(sources: Sequence[SourceData]) -> np.ndarray:
          for s in sources],
         dtype=float,
     )
+
+
+def _effective_tiers(s: SourceData) -> List[Tuple[float, float]]:
+    """(capacity, unit_price) pairs with the open last tier resolved against
+    ``max_volume`` and every tier truncated at the remaining headroom, so the
+    effective capacities always sum to ``min(total capacity, max_volume)``."""
+    tiers: List[Tuple[float, float]] = []
+    acc = 0.0
+    for cap, price in s.price_tiers or []:
+        headroom = max(0.0, float(s.max_volume) - acc)
+        eff = headroom if cap is None else min(float(cap), headroom)
+        tiers.append((max(0.0, eff), float(price)))
+        acc += tiers[-1][0]
+    return tiers
+
+
+def _tier_usage(eff_tiers: Sequence[Tuple[float, float]], volume: float
+                ) -> List[float]:
+    """Decompose a source volume into its pricing tiers.
+
+    The in-order constraints make this decomposition unique: tier k is
+    filled completely before tier k+1 takes anything.  Any residual is
+    solver noise (the MIP itself bounds the volume by the total tier
+    capacity) and is folded into the last tier so the usages sum exactly
+    to ``volume``.
+    """
+    vols: List[float] = []
+    rem = max(0.0, float(volume))
+    for cap, _ in eff_tiers:
+        v = min(rem, cap)
+        vols.append(v)
+        rem -= v
+    if rem > 0.0 and vols:
+        vols[-1] += rem
+    return vols
+
+
+def _allocation_costs(
+    sources: Sequence[SourceData], x: np.ndarray
+) -> Tuple[np.ndarray, List[Optional[List[float]]]]:
+    """Per-source cost and per-tier usage breakdown of a volume vector."""
+    per_source = np.zeros(len(sources))
+    tier_volumes: List[Optional[List[float]]] = []
+    for i, s in enumerate(sources):
+        if s.price_tiers:
+            eff = _effective_tiers(s)
+            vols = _tier_usage(eff, float(x[i]))
+            tier_volumes.append(vols)
+            per_source[i] = float(
+                sum(v * price for v, (_, price) in zip(vols, eff))
+            )
+        else:
+            tier_volumes.append(None)
+            per_source[i] = float(s.cost) * float(x[i])
+    return per_source, tier_volumes
+
+
+def _cost_vector(sources: Sequence[SourceData], model: "_Model") -> np.ndarray:
+    """Full-width linear cost vector: flat cost on the z columns of flat
+    sources, tier unit prices on the tier-usage columns of tiered sources."""
+    c = np.zeros(model.n_vars)
+    for i, s in enumerate(sources):
+        cols = model.tier_cols.get(i)
+        if cols is not None:
+            for col, price in zip(cols, model.tier_prices[i]):
+                c[col] = price
+        else:
+            c[i] = (0.0 if s.cost is None else float(s.cost)) * model.scales[i]
+    return c
 
 
 def _source_bounds(sources: Sequence[SourceData], scales: np.ndarray,
@@ -212,21 +308,18 @@ def _commissioning_constraints(
     threshold: np.ndarray,
     minimum_run: np.ndarray,
     minimum_active: int,
-) -> Tuple[Optional[np.ndarray], Optional[np.ndarray], List[Tuple[float, float]],
-           np.ndarray, Dict[int, int], np.ndarray]:
+    n_vars: int,
+) -> Tuple[List[np.ndarray], List[float], Dict[int, int], np.ndarray]:
     """Build the minimum-run big-M rows and the active-count row.
 
-    Returns (A_struct, b_struct, extended_bounds, y_col, extended_integrality,
-    minimum_run).  Variable layout is (z_0..z_{n-1}, y_0..y_{m-1}) with one
-    binary column per threshold source.
+    Returns (rows, rhs, y_col, minimum_run).  One binary enable column per
+    threshold source sits at ``n + k`` (threshold sources in id-sorted
+    order); the rows are built at the full model width so the tier-pricing
+    columns can follow the enable columns.
     """
     n = len(sources)
     idx = np.flatnonzero(threshold)
-    m = idx.size
-    n_vars = n + m
     y_col = {int(i): n + k for k, i in enumerate(idx)}
-    ext_bounds = list(bounds) + [(0.0, 1.0)] * m
-    integ = np.concatenate([_integrality(sources), np.ones(m)])
 
     rows: List[np.ndarray] = []
     rhs: List[float] = []
@@ -262,9 +355,50 @@ def _commissioning_constraints(
             row[y_col[int(i)]] = -1.0
         rows.append(row)
         rhs.append(float(-minimum_active))
-    A_struct = np.vstack(rows) if rows else None
-    b_struct = np.asarray(rhs) if rows else None
-    return A_struct, b_struct, ext_bounds, y_col, integ, minimum_run
+    return rows, rhs, y_col, minimum_run
+
+
+def _tier_constraints(
+    scales: np.ndarray,
+    tier_caps: Dict[int, List[float]],
+    tier_cols: Dict[int, List[int]],
+    w_cols: Dict[int, List[int]],
+    n_vars: int,
+) -> Tuple[List[np.ndarray], List[float], List[np.ndarray], List[float]]:
+    """Tier-pricing rows at full model width.
+
+    Equality rows couple the tier usages to the source volume
+    (``sum_k t_{i,k} = scale_i z_i``); structural rows enforce in-order
+    consumption with one binary w_{i,k} per tier boundary k >= 1:
+
+        t_{i,k}   <= c_{i,k}   * w_{i,k}   (tier k is closed while w = 0)
+        t_{i,k-1} >= c_{i,k-1} * w_{i,k}   (tier k opens only once k-1 is full)
+    """
+    eq_rows: List[np.ndarray] = []
+    eq_rhs: List[float] = []
+    struct_rows: List[np.ndarray] = []
+    struct_rhs: List[float] = []
+    for i in sorted(tier_cols):
+        cols = tier_cols[i]
+        caps = tier_caps[i]
+        row = np.zeros(n_vars)
+        row[i] = -scales[i]
+        for col in cols:
+            row[col] = 1.0
+        eq_rows.append(row)
+        eq_rhs.append(0.0)
+        for k, w in enumerate(w_cols.get(i, []), start=1):
+            row = np.zeros(n_vars)
+            row[cols[k]] = 1.0
+            row[w] = -caps[k]
+            struct_rows.append(row)
+            struct_rhs.append(0.0)
+            row = np.zeros(n_vars)
+            row[cols[k - 1]] = -1.0
+            row[w] = caps[k - 1]
+            struct_rows.append(row)
+            struct_rhs.append(0.0)
+    return eq_rows, eq_rhs, struct_rows, struct_rhs
 
 
 def _build_model(
@@ -274,22 +408,71 @@ def _build_model(
     caps: Optional[Mapping[str, float]] = None,
     minimum_active_sources: Optional[int] = None,
 ) -> _Model:
-    """Assemble the (mixed-integer) feasible-set description in z-space."""
+    """Assemble the (mixed-integer) feasible-set description in z-space.
+
+    Variable layout: ``(z_1..z_n, y_1..y_m, t..., w...)`` — usage units,
+    enable binaries, tier-usage variables and tier-boundary binaries.
+    """
     n = len(sources)
     scales = _scales(sources)
     bounds = _source_bounds(sources, scales, caps)
     threshold = _threshold_mask(sources)
     minimum_run = _minimum_run(sources)
     minimum_active = int(minimum_active_sources or 0)
-    (A_struct, b_struct, ext_bounds, y_col, integ,
-     minimum_run) = _commissioning_constraints(
-        sources, scales, bounds, threshold, minimum_run, minimum_active
+    m = int(threshold.sum())
+
+    # Tiered-pricing layout: effective capacities are resolved against
+    # max_volume (contingency caps tighten the z bounds only, never the
+    # price segments).
+    tier_caps: Dict[int, List[float]] = {}
+    tier_prices: Dict[int, List[float]] = {}
+    for i, s in enumerate(sources):
+        if s.price_tiers:
+            eff = _effective_tiers(s)
+            tier_caps[i] = [cap for cap, _ in eff]
+            tier_prices[i] = [price for _, price in eff]
+    n_t = sum(len(v) for v in tier_caps.values())
+    n_w = sum(max(0, len(v) - 1) for v in tier_caps.values())
+    n_vars = n + m + n_t + n_w
+
+    tier_cols: Dict[int, List[int]] = {}
+    w_cols: Dict[int, List[int]] = {}
+    col = n + m
+    for i in sorted(tier_caps):
+        tier_cols[i] = list(range(col, col + len(tier_caps[i])))
+        col += len(tier_caps[i])
+    for i in sorted(tier_caps):
+        k = len(tier_caps[i]) - 1
+        if k > 0:
+            w_cols[i] = list(range(col, col + k))
+            col += k
+
+    struct_rows, struct_rhs, y_col, minimum_run = _commissioning_constraints(
+        sources, scales, bounds, threshold, minimum_run, minimum_active, n_vars
     )
-    n_vars = n + int(threshold.sum())
-    A_eq = np.concatenate([scales.reshape(1, -1), np.zeros((1, n_vars - n))], axis=1)
-    b_eq = np.array([float(target_volume)])
+    eq_tier, b_eq_tier, ord_rows, ord_rhs = _tier_constraints(
+        scales, tier_caps, tier_cols, w_cols, n_vars
+    )
+
+    volume_row = np.zeros(n_vars)
+    volume_row[:n] = scales
+    A_eq = np.vstack([volume_row] + eq_tier)
+    b_eq = np.asarray([float(target_volume)] + b_eq_tier, dtype=float)
     A_ub, b_ub = _indicator_constraints(
         sources, target_volume, limits, scales, n_vars
+    )
+    all_struct = struct_rows + ord_rows
+    all_struct_rhs = struct_rhs + ord_rhs
+    A_struct = np.vstack(all_struct) if all_struct else None
+    b_struct = np.asarray(all_struct_rhs) if all_struct else None
+    ext_bounds = (
+        list(bounds)
+        + [(0.0, 1.0)] * m
+        + [(0.0, cap) for i in sorted(tier_caps) for cap in tier_caps[i]]
+        + [(0.0, 1.0)] * n_w
+    )
+    integ = np.concatenate(
+        [_integrality(sources), np.ones(m), np.zeros(n_t), np.ones(n_w)]
     )
     return _Model(
         n=n,
@@ -307,6 +490,9 @@ def _build_model(
         threshold=threshold,
         minimum_active=minimum_active,
         minimum_run=minimum_run,
+        tier_cols=tier_cols,
+        tier_caps=tier_caps,
+        tier_prices=tier_prices,
     )
 
 
@@ -362,8 +548,7 @@ def solve_blend(
         sources, target_volume, limits,
         minimum_active_sources=minimum_active_sources,
     )
-    costs = np.array([s.cost for s in sources], dtype=float)
-    c = np.concatenate([costs * model.scales, np.zeros(model.n_vars - model.n)])
+    c = _cost_vector(sources, model)
 
     res = _lp(c, model)
     if res.status == 2:  # provably infeasible
@@ -373,6 +558,7 @@ def solve_blend(
 
     z = _lexicographic_min(c, res.x, model)
     x = model.scales * z
+    source_costs, tier_volumes = _allocation_costs(sources, x)
     indicators = {
         name: float(np.array([getattr(s, name) for s in sources]) @ x) / target_volume
         for name in INDICATORS
@@ -380,7 +566,9 @@ def solve_blend(
     return SolveOutput(
         status="optimal",
         volumes=x,
-        total_cost=float(costs @ x),
+        total_cost=float(source_costs.sum()),
+        source_costs=source_costs,
+        tier_volumes=tier_volumes,
         indicators=indicators,
     )
 
@@ -468,10 +656,10 @@ def solve_contingency(
       3. among those, minimize the usage vector (source ids ascending)
          lexicographically.
 
-    Target volume, indicator windows, unit costs, batch sizes, minimum-run
-    thresholds and the active-source count are unchanged.  ``new_caps`` only
-    needs to list sources whose cap is reduced; every other source keeps its
-    original ``max_volume``.
+    Target volume, indicator windows, unit costs / price tiers, batch
+    sizes, minimum-run thresholds and the active-source count are
+    unchanged.  ``new_caps`` only needs to list sources whose cap is
+    reduced; every other source keeps its original ``max_volume``.
     """
     sources = sorted(sources, key=lambda s: s.id)
     model = _build_model(
@@ -488,7 +676,7 @@ def solve_contingency(
         if s.batch_size is not None:
             v = float(round(v / s.batch_size) * s.batch_size)
         x0[i] = v
-    costs = np.array([s.cost for s in sources], dtype=float)
+    cost_vec = _cost_vector(sources, model)
 
     # Phase 1: minimize sum(d_i) subject to |scale_i z_i - x0_i| <= d_i.
     # Variables are ordered (z_1..z_n, y_1..y_m, d_1..d_n).
@@ -512,7 +700,7 @@ def solve_contingency(
         raise RuntimeError(f"MIP solver failed (status {p1.status}): {p1.message}")
     adj_star = float(p1.fun)
 
-    c_ext = np.concatenate([costs * scales, np.zeros(nv - n)])
+    c_ext = np.concatenate([cost_vec, np.zeros(nv - model.n_vars)])
     z = _contingency_lexicographic(
         c_ext, x0, adj_star, A1, b1, A1_eq, b1_eq, bounds1, integ1,
         model,
@@ -520,6 +708,8 @@ def solve_contingency(
 
     x = scales * z
     deltas = x - x0
+    source_costs, tier_volumes = _allocation_costs(sources, x)
+    original_costs, _ = _allocation_costs(sources, x0)
     indicators = {
         name: float(np.array([getattr(s, name) for s in sources]) @ x) / target_volume
         for name in INDICATORS
@@ -529,8 +719,10 @@ def solve_contingency(
         volumes=x,
         deltas=deltas,
         total_adjustment=float(np.abs(deltas).sum()),
-        total_cost=float(costs @ x),
-        cost_delta=float(costs @ (x - x0)),
+        total_cost=float(source_costs.sum()),
+        cost_delta=float((source_costs - original_costs).sum()),
+        source_costs=source_costs,
+        tier_volumes=tier_volumes,
         indicators=indicators,
     )
 
@@ -629,6 +821,9 @@ def _contingency_lexicographic(
         threshold=model.threshold,
         minimum_active=model.minimum_active,
         minimum_run=model.minimum_run,
+        tier_cols=model.tier_cols,
+        tier_caps=model.tier_caps,
+        tier_prices=model.tier_prices,
     )
     try:
         return _sequential_min(ext_model, A_l1, b_l1, A_eq3, b_eq3)
