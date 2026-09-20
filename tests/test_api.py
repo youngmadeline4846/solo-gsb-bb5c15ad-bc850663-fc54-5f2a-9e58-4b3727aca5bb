@@ -812,3 +812,278 @@ def test_contingency_minimum_run_shuts_source_off(client):
     blend = {a["source_id"]: a["new_volume"] for a in body["blend"]}
     assert blend["A"] == pytest.approx(0.0, abs=1e-6)
     assert blend["B"] == pytest.approx(700.0, abs=1e-6)
+
+# --------------------------------------------------------------------------- #
+# price_tiers end-to-end
+# --------------------------------------------------------------------------- #
+
+def _tier_request(idempotency_key=None):
+    payload = {
+        "target_volume": 1000,
+        "sources": [
+            {"id": "W1", "max_volume": 1000, "cost": 2.0, "calcium": 50,
+             "magnesium": 10, "alkalinity": 100},
+            {"id": "W2", "max_volume": 1000,
+             "price_tiers": [
+                 {"capacity": 300, "price": 1.0},
+                 {"capacity": None, "price": 3.0},
+             ],
+             "calcium": 50, "magnesium": 10, "alkalinity": 100},
+        ],
+    }
+    if idempotency_key is not None:
+        payload["idempotency_key"] = idempotency_key
+    return payload
+
+
+def test_solve_with_price_tiers(client):
+    r = client.post("/api/v1/blends/solve", json=_tier_request())
+    assert r.status_code == 200, r.text
+    body = r.json()
+    assert body["status"] == "optimal"
+    rows = {a["source_id"]: a for a in body["blend"]}
+    # W2's cheap block (300 @ 1) is drawn first; W1 flat @ 2 beats W2's
+    # second block @ 3 for the remaining 700: 300 + 1400 = 1700.
+    assert rows["W1"]["volume"] == pytest.approx(700.0, abs=1e-6)
+    assert rows["W1"]["cost"] == pytest.approx(1400.0, abs=1e-6)
+    assert rows["W1"]["tiers"] is None
+    assert rows["W2"]["volume"] == pytest.approx(300.0, abs=1e-6)
+    assert rows["W2"]["cost"] == pytest.approx(300.0, abs=1e-6)
+    assert rows["W2"]["tiers"] == [
+        {"capacity": 300.0, "price": 1.0, "volume": 300.0, "cost": 300.0},
+        {"capacity": None, "price": 3.0, "volume": 0.0, "cost": 0.0},
+    ]
+    assert body["total_cost"] == pytest.approx(1700.0, abs=1e-6)
+    # total_cost is the sum of the per-source tier sums
+    assert body["total_cost"] == pytest.approx(
+        sum(t["cost"] for a in body["blend"]
+            for t in (a["tiers"] or [{"cost": a["cost"]}])),
+        abs=1e-6,
+    )
+
+
+def test_price_tiers_with_batch_and_indicator(client):
+    payload = {
+        "target_volume": 1000,
+        "calcium": {"min": 40, "max": 80},
+        "sources": [
+            {"id": "A", "max_volume": 1000, "cost": 2.0, "calcium": 100,
+             "magnesium": 10, "alkalinity": 100},
+            {"id": "B", "max_volume": 1000, "batch_size": 300,
+             "price_tiers": [
+                 {"capacity": 300, "price": 1.0},
+                 {"capacity": None, "price": 3.0},
+             ],
+             "calcium": 20, "magnesium": 10, "alkalinity": 100},
+        ],
+    }
+    r = client.post("/api/v1/blends/solve", json=payload)
+    assert r.status_code == 200, r.text
+    body = r.json()
+    rows = {a["source_id"]: a for a in body["blend"]}
+    # two batches from B (600 = 300 @ 1 + 300 @ 3 = 1200) + A 400 @ 2 = 800
+    # gives calcium 52 within the window; one batch (300 @ 1) + A 700 @ 2
+    # gives calcium 76 and costs 1700 -> the MIP picks the cheaper 2000? no:
+    # 1200 + 800 = 2000 vs 300 + 1400 = 1700, so one batch is optimal.
+    assert rows["A"]["volume"] == pytest.approx(700.0, abs=1e-6)
+    assert rows["B"]["volume"] == pytest.approx(300.0, abs=1e-6)
+    assert body["total_cost"] == pytest.approx(1700.0, abs=1e-6)
+    assert rows["B"]["tiers"] == [
+        {"capacity": 300.0, "price": 1.0, "volume": 300.0, "cost": 300.0},
+        {"capacity": None, "price": 3.0, "volume": 0.0, "cost": 0.0},
+    ]
+    assert body["indicators"]["calcium"] == pytest.approx(76.0, abs=1e-6)
+
+
+def test_price_tiers_plan_persisted_replayed_and_fetched(client):
+    payload = _tier_request(idempotency_key="tier-plan-1")
+    r1 = client.post("/api/v1/blends", json=payload)
+    assert r1.status_code == 201, r1.text
+    r2 = client.post("/api/v1/blends", json=payload)
+    assert r2.status_code == 200
+    assert r2.headers.get("x-idempotent-replay") == "true"
+    assert r2.json() == r1.json()
+    g = client.get(f"/api/v1/blends/{r1.json()['plan_id']}")
+    assert g.status_code == 200
+    assert g.json() == r1.json()
+    rows = {a["source_id"]: a for a in g.json()["blend"]}
+    assert rows["W2"]["tiers"][0]["volume"] == pytest.approx(300.0, abs=1e-6)
+
+
+def test_price_tiers_part_of_idempotency_fingerprint(client):
+    with_tiers = _tier_request(idempotency_key="tier-fp")
+    assert client.post("/api/v1/blends", json=with_tiers).status_code == 201
+    # same key, tiers replaced by a flat cost: different request -> conflict
+    flat = _tier_request(idempotency_key="tier-fp")
+    flat["sources"][1].pop("price_tiers")
+    flat["sources"][1]["cost"] = 1.5
+    assert client.post("/api/v1/blends", json=flat).status_code == 409
+    # changing a tier price alone is also a different request
+    changed_price = _tier_request(idempotency_key="tier-fp")
+    changed_price["sources"][1]["price_tiers"][1]["price"] = 4.0
+    assert client.post("/api/v1/blends", json=changed_price).status_code == 409
+
+
+def test_price_tiers_contingency(client):
+    r = client.post(
+        "/api/v1/blends", json=_tier_request(idempotency_key="tier-cont-1")
+    )
+    assert r.status_code == 201, r.text
+    plan_id = r.json()["plan_id"]
+    # cut W2 to 200: its null last block spans zero volume and 100 units
+    # move to W1 @ 2
+    rc = client.post(
+        f"/api/v1/blends/{plan_id}/contingency", json={"W2": 200}
+    )
+    assert rc.status_code == 200, rc.text
+    body = rc.json()
+    assert body["status"] == "optimal"
+    rows = {a["source_id"]: a for a in body["blend"]}
+    assert rows["W2"]["new_volume"] == pytest.approx(200.0, abs=1e-6)
+    assert rows["W2"]["new_cap"] == pytest.approx(200.0, abs=1e-6)
+    assert rows["W2"]["tiers"] == [
+        {"capacity": 300.0, "price": 1.0, "volume": 200.0, "cost": 200.0},
+        {"capacity": None, "price": 3.0, "volume": 0.0, "cost": 0.0},
+    ]
+    assert rows["W1"]["new_volume"] == pytest.approx(800.0, abs=1e-6)
+    assert body["total_cost"] == pytest.approx(1800.0, abs=1e-6)
+    assert body["cost_delta"] == pytest.approx(100.0, abs=1e-6)
+    assert body["total_adjustment"] == pytest.approx(200.0, abs=1e-6)
+    # the stored plan keeps the original tier configuration untouched
+    g = client.get(f"/api/v1/blends/{plan_id}")
+    stored = {a["source_id"]: a for a in g.json()["blend"]}
+    assert stored["W2"]["tiers"][1]["price"] == 3.0
+
+
+def test_price_tiers_contingency_infeasible(client):
+    payload = {
+        "target_volume": 1000,
+        "calcium": {"min": 40, "max": 60},
+        "idempotency_key": "tier-cont-inf",
+        "sources": [
+            {"id": "W1", "max_volume": 600, "calcium": 100,
+             "magnesium": 30, "alkalinity": 250,
+             "price_tiers": [{"capacity": None, "price": 1.0}]},
+            {"id": "W2", "max_volume": 800, "cost": 2.0, "calcium": 20,
+             "magnesium": 5, "alkalinity": 80},
+        ],
+    }
+    plan = client.post("/api/v1/blends", json=payload).json()
+    assert plan["status"] == "optimal"
+    r = client.post(
+        f"/api/v1/blends/{plan['plan_id']}/contingency", json={"W1": 200}
+    )
+    assert r.status_code == 200
+    body = r.json()
+    assert body["status"] == "infeasible"
+    assert body["achievable_ranges"]["calcium"]["max"] == pytest.approx(
+        36.0, abs=1e-6
+    )
+
+
+def test_tiered_infeasible_plan_is_persisted(client):
+    payload = {
+        "target_volume": 1000,
+        "calcium": {"min": 70, "max": 90},
+        "idempotency_key": "tier-infeasible",
+        "sources": [
+            {"id": "W1", "max_volume": 600, "calcium": 100, "magnesium": 30,
+             "alkalinity": 250,
+             "price_tiers": [{"capacity": None, "price": 1.0}]},
+            {"id": "W2", "max_volume": 800, "calcium": 20, "magnesium": 5,
+             "alkalinity": 80,
+             "price_tiers": [{"capacity": None, "price": 2.0}]},
+        ],
+    }
+    r = client.post("/api/v1/blends", json=payload)
+    assert r.status_code == 201
+    body = r.json()
+    assert body["status"] == "infeasible"
+    assert body["achievable_ranges"]["calcium"]["max"] == pytest.approx(68.0)
+    g = client.get(f"/api/v1/blends/{body['plan_id']}")
+    assert g.json()["status"] == "infeasible"
+
+
+@pytest.mark.parametrize("bad_tiers", [
+    # null capacity before the last tier (a "gap")
+    [{"capacity": None, "price": 1.0}, {"capacity": 500, "price": 2.0}],
+    # zero capacity
+    [{"capacity": 0, "price": 1.0}, {"capacity": None, "price": 2.0}],
+    # negative capacity
+    [{"capacity": -10, "price": 1.0}, {"capacity": None, "price": 2.0}],
+    # negative price
+    [{"capacity": 300, "price": -1.0}, {"capacity": None, "price": 2.0}],
+    # finite total capacity below max_volume (W1 cap in make_request: 600)
+    [{"capacity": 200, "price": 1.0}, {"capacity": 300, "price": 2.0}],
+    # empty tier list
+    [],
+])
+def test_price_tiers_validation(client, bad_tiers):
+    payload = make_request()
+    payload["sources"][0].pop("cost")
+    payload["sources"][0]["price_tiers"] = bad_tiers
+    r = client.post("/api/v1/blends/solve", json=payload)
+    assert r.status_code == 422, r.text
+
+
+@pytest.mark.parametrize("token", ["NaN", "Infinity", "-Infinity"])
+def test_price_tiers_capacity_and_price_must_be_finite(client, token):
+    raw = (
+        '{"target_volume": 1000, "sources": ['
+        '{"id": "W1", "max_volume": 600, "calcium": 100, "magnesium": 30,'
+        ' "alkalinity": 250, "price_tiers": [{"capacity": ' + token + ','
+        ' "price": 1.0}]},'
+        '{"id": "W2", "max_volume": 800, "cost": 2.0, "calcium": 20,'
+        ' "magnesium": 5, "alkalinity": 80}'
+        ']}'
+    )
+    r = client.post(
+        "/api/v1/blends/solve", content=raw,
+        headers={"Content-Type": "application/json"},
+    )
+    assert r.status_code == 422, r.text
+
+
+@pytest.mark.parametrize("token", ["NaN", "Infinity", "-Infinity"])
+def test_price_tiers_price_must_be_finite(client, token):
+    raw = (
+        '{"target_volume": 1000, "sources": ['
+        '{"id": "W1", "max_volume": 600, "calcium": 100, "magnesium": 30,'
+        ' "alkalinity": 250, "price_tiers": [{"capacity": 600, "price": '
+        + token + '}]},'
+        '{"id": "W2", "max_volume": 800, "cost": 2.0, "calcium": 20,'
+        ' "magnesium": 5, "alkalinity": 80}'
+        ']}'
+    )
+    r = client.post(
+        "/api/v1/blends/solve", content=raw,
+        headers={"Content-Type": "application/json"},
+    )
+    assert r.status_code == 422, r.text
+
+
+def test_cost_and_price_tiers_are_mutually_exclusive(client):
+    payload = make_request()
+    payload["sources"][0]["price_tiers"] = [{"capacity": None, "price": 1.0}]
+    r = client.post("/api/v1/blends/solve", json=payload)
+    assert r.status_code == 422
+    payload["sources"][0].pop("cost")
+    assert client.post("/api/v1/blends/solve", json=payload).status_code == 200
+
+
+def test_price_tiers_capacity_covering_max_volume_is_valid(client):
+    payload = make_request()
+    payload["sources"][0].pop("cost")
+    payload["sources"][0]["price_tiers"] = [
+        {"capacity": 600, "price": 1.0}  # exactly max_volume
+    ]
+    assert client.post("/api/v1/blends/solve", json=payload).status_code == 200
+
+
+def test_price_tiers_numeric_strings_coerce(client):
+    payload = make_request()
+    payload["sources"][0].pop("cost")
+    payload["sources"][0]["price_tiers"] = [
+        {"capacity": "600", "price": "1.0"}
+    ]
+    assert client.post("/api/v1/blends/solve", json=payload).status_code == 200

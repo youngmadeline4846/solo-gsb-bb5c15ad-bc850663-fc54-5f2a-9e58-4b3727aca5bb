@@ -20,12 +20,64 @@ class IndicatorRange(BaseModel):
         return self
 
 
+class PriceTier(BaseModel):
+    """One marginal price block of a source.
+
+    ``capacity`` is the block size in m3; the last tier of a source may use
+    ``null`` to cover all supply up to that source's ``max_volume``.
+    ``price`` is the unit cost of every m3 drawn inside this block.
+    """
+
+    capacity: Optional[float] = Field(
+        default=None,
+        description=(
+            "block capacity in m3; only the final tier may use null, which "
+            "covers the remaining supply up to max_volume"
+        ),
+    )
+    price: float = Field(..., ge=0, description="unit price inside this block")
+
+    @field_validator("capacity", "price", mode="before")
+    @classmethod
+    def _coerce_finite(cls, v: Any) -> Any:
+        return _finite_non_negative(v, "price tier value")
+
+
+def _finite_non_negative(v: Any, field: str) -> Any:
+    """Reject booleans and NaN/+inf/-inf; non-negative gates live on Field."""
+    if v is None:
+        return None
+    if isinstance(v, bool):
+        raise ValueError(f"{field} must be a finite non-negative number")
+    try:
+        f = float(v)
+    except (TypeError, ValueError):
+        return v  # let Pydantic produce its standard type error
+    if not math.isfinite(f):
+        raise ValueError(f"{field} must be a finite non-negative number")
+    return f
+
+
 class Source(BaseModel):
     """One candidate water source."""
 
     id: str = Field(..., min_length=1, max_length=64, description="unique source id")
     max_volume: float = Field(..., ge=0, description="available volume, m3")
-    cost: float = Field(..., ge=0, description="cost per m3")
+    cost: Optional[float] = Field(
+        default=None,
+        ge=0,
+        description=(
+            "flat cost per m3; exactly one of cost / price_tiers must be set"
+        ),
+    )
+    price_tiers: Optional[List[PriceTier]] = Field(
+        default=None,
+        description=(
+            "optional ordered marginal price blocks; when set it replaces the "
+            "flat cost: blocks are consumed in order and a later block opens "
+            "only after the previous one is exhausted"
+        ),
+    )
     calcium: float = Field(..., ge=0, description="calcium concentration, mg/L")
     magnesium: float = Field(..., ge=0, description="magnesium concentration, mg/L")
     alkalinity: float = Field(..., ge=0, description="alkalinity, mg/L as CaCO3")
@@ -55,6 +107,11 @@ class Source(BaseModel):
     def _coerce_id(cls, v: Any) -> str:
         return str(v).strip()
 
+    @field_validator("cost", mode="before")
+    @classmethod
+    def _coerce_cost(cls, v: Any) -> Any:
+        return _finite_non_negative(v, "cost")
+
     @staticmethod
     def _finite_positive(v: Any, field: str) -> Any:
         """Reject NaN/+inf/-inf explicitly and non-finite numeric strings.
@@ -83,6 +140,39 @@ class Source(BaseModel):
     @classmethod
     def _coerce_minimum_run_volume(cls, v: Any) -> Any:
         return cls._finite_positive(v, "minimum_run_volume")
+
+    @model_validator(mode="after")
+    def _validate_pricing(self) -> "Source":
+        tiers = self.price_tiers
+        if (self.cost is None) == (tiers is None):
+            raise ValueError(
+                "exactly one of 'cost' and 'price_tiers' must be provided"
+            )
+        if tiers is None:
+            return self
+        if len(tiers) < 1:
+            raise ValueError("price_tiers must contain at least one tier")
+        for idx, tier in enumerate(tiers):
+            is_last = idx == len(tiers) - 1
+            if tier.capacity is None:
+                if not is_last:
+                    raise ValueError(
+                        "price_tiers has a null-capacity tier before the last "
+                        "tier; only the final tier may use null capacity"
+                    )
+            elif tier.capacity <= 0:
+                raise ValueError(
+                    f"price_tiers[{idx}].capacity must be positive"
+                )
+        if tiers[-1].capacity is not None:
+            total = float(sum(t.capacity for t in tiers))
+            if total + 1e-9 < self.max_volume:
+                raise ValueError(
+                    "the total price_tiers capacity must cover max_volume "
+                    f"({total:g} < {self.max_volume:g}); set the last tier "
+                    "capacity to null or increase it"
+                )
+        return self
 
 
 class BlendRequest(BaseModel):
@@ -125,10 +215,22 @@ class PlanCreateRequest(BlendRequest):
     idempotency_key: Optional[str] = Field(default=None, min_length=1, max_length=255)
 
 
+class TierUsage(BaseModel):
+    """Volume drawn from one declared price block and its cost."""
+
+    capacity: Optional[float]
+    price: float
+    volume: float
+    cost: float
+
+
 class Allocation(BaseModel):
     source_id: str
     volume: float
     cost: float
+    # Present only for sources priced via price_tiers: per-block usage in
+    # declaration order; ``cost`` is the sum of the tier costs.
+    tiers: Optional[List[TierUsage]] = None
 
 
 class OptimalPlan(BaseModel):
@@ -156,6 +258,9 @@ class ContingencyAllocation(BaseModel):
     volume_delta: float
     new_cap: float
     cost: float
+    # Present only for sources priced via price_tiers: per-block usage of
+    # the NEW allocation (blocks are clamped by the reduced cap).
+    tiers: Optional[List[TierUsage]] = None
 
 
 class ContingencyPlan(BaseModel):

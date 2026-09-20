@@ -1,8 +1,12 @@
 # 饮用水混配优化 API（Drinking Water Blending API）
 
 基于 **Python + FastAPI + SciPy + SQLite** 的饮用水混配优化服务。用户提交目标体积、
-钙 / 镁 / 碱度区间以及 2～6 种水源的浓度、可用量与单位成本，服务求解满足全部区间
-与供给上限的**最低成本配比**；每个水源还可设置可选的 **`batch_size`（批次体积，m³）**，
+钙 / 镁 / 碱度区间以及 2～6 种水源的浓度、可用量与计价，服务求解满足全部区间
+与供给上限的**最低成本配比**。每个水源的计价二选一：单一单位成本 **`cost`**，或
+**`price_tiers`（水源阶梯计价）**——按声明顺序给出若干容量档及该档单价，用水**必须
+按档顺序消耗**（后一档只有前档用满才能启用，由二元"用满标记"变量在同一 MIP 中联立），
+最后一档容量可为 `null` 表示覆盖至 `max_volume`；设置阶梯后替代单一 `cost`，响应按
+水源返回各档用量与成本。每个水源还可设置可选的 **`batch_size`（批次体积，m³）**，
 设置后该水源的用量必须是 `batch_size` 的**非负整数倍**且不超过 `max_volume`，未设置时
 保持连续变量。每个水源还可设置可选的 **`minimum_run_volume`（投运门槛，m³）**，设置后
 该水源的用量**只能为 0 或不低于该门槛**（由二元启用变量 `y_i ∈ {0,1}` 在同一 MIP 中
@@ -11,8 +15,9 @@
 （MIP）**中求解，不会先求连续解再四舍五入，也**不会先求解再剔除小用量**。成本并列时取
 **按水源 ID 排序后用量向量字典序最小**的方案；问题不可行时返回**各指标在同一混合整数
 可行集上的可达范围**。支持以**幂等键**保存方案并按 ID 查询。对于已保存且状态为
-`optimal` 的方案，还可通过**供给缩减预案接口**在不改动原方案的前提下（完整保留批次与
-投运约束），按"先最小化总调整量、再最小化成本、并列取用量向量字典序最小"重新配水。
+`optimal` 的方案，还可通过**供给缩减预案接口**在不改动原方案的前提下（完整保留阶梯
+计价、批次与投运约束），按"先最小化总调整量、再最小化成本、并列取用量向量字典序
+最小"重新配水。
 
 ## 快速开始（单条命令：安装 + 建库 + 启动）
 
@@ -51,9 +56,68 @@ Compose 默认将宿主机 `8000` 映射到容器 `8000`，并通过命名卷 `b
 ## 单位约定
 
 - 体积：m³（`target_volume`、`max_volume`、响应中的 `volume`、可选的 `batch_size`、
-  可选的 `minimum_run_volume`）
+  可选的 `minimum_run_volume`、`price_tiers` 各档 `capacity`）
 - 浓度：mg/L（钙、镁；碱度按 mg/L CaCO₃ 计）
-- 成本：任意货币单位 / m³
+- 成本：任意货币单位 / m³（单一 `cost` 或各档 `price`）
+
+## 水源阶梯计价（`price_tiers`，可选）
+
+每个水源**二选一**提供计价：
+
+- `cost`：单一单位成本（与既有行为完全一致）；
+- `price_tiers`：非空的阶梯数组，每档 `{"capacity": <m³>, "price": <单价>}`，
+  按**声明顺序**给出边际容量与该档单价；**最后一档**的 `capacity` 可为 `null`，
+  表示覆盖前面各档之后直到 `max_volume` 的全部供给。
+
+设置 `price_tiers` 后**替代**单一 `cost`（二者同时给或都不给均返回 `422`）。求解时为
+每个阶梯水源引入连续分档用量 `q_{i,t} ≥ 0` 与二元"用满标记" `w_{i,t} ∈ {0,1}`，
+全部变量与批次、投运变量处在**同一个 MIP**：
+
+```
+x_i            = Σ_t q_{i,t}                 # 总用量等于各档之和
+0 ≤ q_{i,t}   ≤ cap_{i,t}                    # 不超过该档容量
+cap_{i,t}·w_{i,t} ≤ q_{i,t}     (t < 末档)   # w_t=1 表示第 t 档必须用满
+q_{i,t+1}      ≤ cap_{i,t+1}·w_{i,t}         # 后一档进水必须前档已用满
+```
+
+因此用水**严格按档顺序消耗**：只要后一档进了 1 m³，前面所有档都必然是满的；当前正在
+使用的"开口档"可以不满。**不存在"跳过贵的前档直接用便宜后档"的取巧解**——例如前 300 m³
+单价 3、之后单价 0.5 的水源取 500 m³，成本只能是 `300·3 + 200·0.5 = 1000`。末档没有后继
+档位，故不设二元标记。阶梯水源的目标函数为 `Σ_t price_{i,t}·q_{i,t}`，`total_cost` 即
+**各水源分档成本的汇总**。阶梯可与 `batch_size` 同时设置：批次整数变量约束总取水量，
+跨越档位边界的那一个批次按边际单价在两档之间拆分计价。
+
+响应中每个阶梯水源的配比带 `tiers` 数组（按声明顺序，每档给出 `capacity` / `price` /
+`volume` / `cost`；`null` 容量档原样回显）；平单价水源该字段为 `null`，水源级
+`cost` 为其分档成本之和。例如：
+
+```json
+{
+  "source_id": "W2",
+  "volume": 300.0,
+  "cost": 300.0,
+  "tiers": [
+    {"capacity": 300.0, "price": 1.0, "volume": 300.0, "cost": 300.0},
+    {"capacity": null,  "price": 3.0, "volume": 0.0,   "cost": 0.0}
+  ]
+}
+```
+
+**校验（不满足返回 `422`）**：
+
+- 同时提供 `cost` 与 `price_tiers`，或二者都省略；
+- `price_tiers` 为空数组；
+- **断档**：非最后一档的 `capacity` 为 `null`（只有末档允许 `null`）；
+- 任一档 `capacity ≤ 0`（0、负数、NaN/±Infinity、布尔值、非数字）；
+- 任一档 `price < 0`（负单价、NaN/±Infinity、布尔值、非数字；单价为 0 合法）；
+- 末档容量是具体数字时，**各档容量之和小于 `max_volume`**（无法覆盖整个供给；
+  等于或大于 `max_volume` 合法，超出部分取不到）。
+
+阶梯配置与其他设置一样全程保留：保存请求（`request_json`）、幂等指纹（SHA-256 规范化
+JSON，改动任一档容量 / 单价或增删档位即构成不同请求，重放同一幂等键返回 `409`）、
+按 ID 查询与供给缩减预案均携带完整 `price_tiers`。预案时各档容量按缩减后的新上限
+重新折算（`null` 末档只覆盖到新上限；批次水源先按 `⌊新上限 / batch_size⌋` 折算格点
+上限），阶梯顺序约束在缩减后的可行集上仍然成立，响应按新用量返回各档用量。
 
 ## 投运约束（`minimum_run_volume` 与 `minimum_active_sources`，可选）
 
@@ -231,9 +295,7 @@ curl -X POST http://localhost:8000/api/v1/blends/solve \
 
 `minimum_active_sources` 要求至少指定数量的门槛水源投运。下例两个水源门槛均为 300、
 目标 700、K=2，单水源方案（A=700，成本 700）被计数约束排除；两个水源必须同时启用，
-最优为 A=400、B=300（成本 1000）：
-
-```bash
+最优为 A=400、B=300（成本 1000）：```bash
 curl -X POST http://localhost:8000/api/v1/blends/solve \
   -H 'Content-Type: application/json' \
   -d '{
@@ -254,6 +316,49 @@ curl -X POST http://localhost:8000/api/v1/blends/solve \
 `achievable_ranges.volume` 给出不超过目标的最大可达体积，各指标可达范围也在保留全部
 投运 / 批次约束的同一 MIP 上计算。
 
+使用阶梯计价时以 `price_tiers` 替代 `cost`。下例 W1 单一成本 2，W2 前 300 m³ 单价 1、
+其后（`null` 末档覆盖至 `max_volume` 1000）单价 3；目标 1000：
+
+```bash
+curl -X POST http://localhost:8000/api/v1/blends/solve \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "target_volume": 1000,
+    "sources": [
+      {"id": "W1", "max_volume": 1000, "cost": 2.0, "calcium": 50, "magnesium": 10, "alkalinity": 100},
+      {"id": "W2", "max_volume": 1000,
+       "price_tiers": [{"capacity": 300, "price": 1.0}, {"capacity": null, "price": 3.0}],
+       "calcium": 50, "magnesium": 10, "alkalinity": 100}
+    ]
+  }'
+```
+
+阶梯必须按序消耗：W2 的便宜首档 300 m³ 被取满（300），W2 第二档单价 3 高于 W1 的 2，
+剩余 700 m³ 全部取自 W1（1400），`total_cost = 300 + 1400 = 1700`，分档用量随响应返回：
+
+```json
+{
+  "status": "optimal",
+  "plan_id": null,
+  "total_volume": 1000.0,
+  "total_cost": 1700.0,
+  "blend": [
+    {"source_id": "W1", "volume": 700.0, "cost": 1400.0, "tiers": null},
+    {"source_id": "W2", "volume": 300.0, "cost": 300.0,
+     "tiers": [
+       {"capacity": 300.0, "price": 1.0, "volume": 300.0, "cost": 300.0},
+       {"capacity": null,  "price": 3.0, "volume": 0.0,   "cost": 0.0}
+     ]}
+  ],
+  "indicators": {"calcium": 50.0, "magnesium": 10.0, "alkalinity": 100.0}
+}
+```
+
+阶梯可与批次、投运门槛、最少投运数及水质区间任意组合：取整批水量的批次约束约束总
+取水体积，跨档边界的批次按两档边际单价分别计价；阶梯顺序的二元变量与启用变量、
+批次数变量同处一个 MIP 联合优化。非法阶梯（断档、容量非正、负单价、总容量不足）返回
+`422`，详见上文"水源阶梯计价"的校验清单。
+
 ### `POST /api/v1/blends` — 求解并以幂等键保存
 
 幂等键可放在请求体 `idempotency_key` 字段或 `Idempotency-Key` 请求头中（二者至少其一，
@@ -270,8 +375,8 @@ curl -X POST http://localhost:8000/api/v1/blends \
 - 以**相同键 + 相同请求**重发：返回 `200` 与已保存的方案，并带响应头
   `X-Idempotent-Replay: true`（不会重复求解或新建记录）；
 - 以**相同键 + 不同请求**重发：返回 `409 Conflict`（仅增删或改动
-  `batch_size`、`minimum_run_volume`，或改动 `minimum_active_sources`
-  也算不同请求——这些设置全部参与指纹）；
+  `batch_size`、`minimum_run_volume`、`price_tiers`（任一档容量 / 单价），
+  或改动 `minimum_active_sources` 也算不同请求——这些设置全部参与指纹）；
 - 缺少幂等键：返回 `422`。
 
 ### `GET /api/v1/blends/{plan_id}` — 按 ID 查询已保存方案
@@ -299,7 +404,11 @@ curl http://localhost:8000/api/v1/blends/1
 整除值时，其零头不可用。同样，各水源的 `minimum_run_volume` 与请求的
 `minimum_active_sources` 也从保存请求中恢复并**全程保留**：新上限低于门槛时该水源只能
 停用（若同时带批次，最低批次数按 `⌈门槛 / batch_size⌉` 并以新上限折算）；缩减导致可达
-门槛的水源数不足 K 时预案不可行，返回体含 `achievable_ranges.active_sources`。
+门槛的水源数不足 K 时预案不可行，返回体含 `achievable_ranges.active_sources`。各水源的
+**`price_tiers` 同样完整恢复并保留**：各档容量按缩减后的新上限重新折算（`null` 末档
+只覆盖到新上限；批次水源先折算格点上限），阶梯必须按序消耗的二元约束在新可行集上继续
+成立；响应 `blend[].tiers` 按**新用量**给出各档用量与成本（`new_cap` 低于原上限时
+`capacity: null` 末档仍原样回显，但其可覆盖体积已被新上限钳制）。
 
 预案**不会被保存，也不会修改原方案**；接口可对同一方案反复调用。
 
@@ -360,6 +469,10 @@ curl -X POST http://localhost:8000/api/v1/blends/1/contingency \
 | 请求体不是 JSON 对象                       | `422`  |
 | `batch_size` / `minimum_run_volume` 为 0、负数、NaN/±Infinity、布尔值或非数字 | `422` |
 | `minimum_active_sources` 为负数、小数、布尔值或非数字 | `422` |
+| 同时给 / 都不给 `cost` 与 `price_tiers`，或 `price_tiers` 为空数组 | `422` |
+| `price_tiers` 断档（非末档容量为 `null`）、某档容量 ≤ 0（含 NaN/±Infinity、布尔值、非数字） | `422` |
+| `price_tiers` 某档 `price` 为负、NaN/±Infinity、布尔值或非数字 | `422` |
+| 末档容量为具体数字但各档容量之和小于 `max_volume` | `422` |
 
 ### 不可行响应
 
@@ -377,26 +490,34 @@ curl -X POST http://localhost:8000/api/v1/blends/1/contingency \
 }
 ```
 
-可达范围指：在供给上限、目标体积、**批次约束与投运约束**下（若目标体积无法拼出或
-总供给不足，则改用可实现的最大体积），各指标在混配水中可实现的浓度区间（对每个指标
-分别在同一混合整数模型上求解 min/max 两个 MIP 得到的投影范围，二元启用变量与计数约束
-一并保留）。总可用水量不足目标体积、目标体积不在批次格点上，或门槛 / 计数约束使正体积
-配比不存在时，额外返回 `achievable_ranges.volume.max`；`minimum_active_sources` 无法满足
-时额外返回 `achievable_ranges.active_sources = {requested, available}`。不可行方案同样会
-被保存，可按 ID 查询。
+可达范围指：在供给上限、目标体积、**批次约束、阶梯顺序约束与投运约束**下（若目标体积
+无法拼出或总供给不足，则改用可实现的最大体积），各指标在混配水中可实现的浓度区间
+（对每个指标分别在同一混合整数模型上求解 min/max 两个 MIP 得到的投影范围，二元启用
+变量、阶梯用满标记与计数约束一并保留）。总可用水量不足目标体积、目标体积不在批次格点
+上，或门槛 / 计数约束使正体积配比不存在时，额外返回 `achievable_ranges.volume.max`；
+`minimum_active_sources` 无法满足时额外返回
+`achievable_ranges.active_sources = {requested, available}`。不可行方案同样会被保存，
+可按 ID 查询。
 
 ## 规则与语义
 
 - **优化模型**：混合整数线性规划（SciPy `linprog`，HiGHS 求解器，整数变量通过
-  `integrality=` 声明）。变量为各水源的取水单位 `z_i ≥ 0` 与门槛水源的二元启用变量
-  `y_i ∈ {0,1}`：未设置 `batch_size` 时 `z_i` 连续、用量 `x_i = z_i`；设置批次 `b_i`
-  时 `z_i` 为非负整数、用量 `x_i = b_i·z_i`。设置门槛 `m_i` 的水源满足
-  `x_i ≤ U_i·y_i`、`x_i ≥ m̂_i·y_i`（批次水源 `m̂_i = ⌈m_i/b_i⌉·b_i`，否则 `m̂_i = m_i`）；
-  设置 K=`minimum_active_sources` 时 `Σ_{门槛} y_i ≥ K`。目标 `min Σ cost_i·x_i`；
+  `integrality=` 声明）。变量为各水源的取水单位 `z_i ≥ 0`、门槛水源的二元启用变量
+  `y_i ∈ {0,1}`，以及阶梯水源的分档用量 `q_{i,t} ≥ 0` 与各非末档的二元用满标记
+  `w_{i,t} ∈ {0,1}`：未设置 `batch_size` 时 `z_i` 连续、用量 `x_i = z_i`；设置批次
+  `b_i` 时 `z_i` 为非负整数、用量 `x_i = b_i·z_i`。平单价水源 `x_i = z_i` 或 `b_i·z_i`
+  按 `cost_i` 计价；阶梯水源满足 `x_i = Σ_t q_{i,t}`、
+  `cap_{i,t}·w_{i,t} ≤ q_{i,t} ≤ cap_{i,t}`（非末档）、
+  `0 ≤ q_{i,末} ≤ cap_{i,末}` 且 `q_{i,t+1} ≤ cap_{i,t+1}·w_{i,t}`，
+  目标中按 `Σ_t price_{i,t}·q_{i,t}` 计价（后一档进水必须前档用满）。设置门槛 `m_i`
+  的水源满足 `x_i ≤ U_i·y_i`、`x_i ≥ m̂_i·y_i`（批次水源
+  `m̂_i = ⌈m_i/b_i⌉·b_i`，否则 `m̂_i = m_i`）；设置 K=`minimum_active_sources` 时
+  `Σ_{门槛} y_i ≥ K`。目标 `min Σ cost_i·x_i`（阶梯水源替换为分档边际成本和）；
   约束 `Σx_i = 目标体积`、
   `lo_j·V ≤ Σ conc_ij·x_i ≤ hi_j·V`（钙/镁/碱度）、
-  `0 ≤ z_i ≤ ⌊max_volume_i / b_i⌋`（连续水源为 `x_i ≤ max_volume_i`）。连续、批次与
-  投运变量联合求解，**不会先求连续解再取整，也不会先求解再剔除小用量**。
+  `0 ≤ z_i ≤ ⌊max_volume_i / b_i⌋`（连续水源为 `x_i ≤ max_volume_i`；阶梯档容量
+  同样受供给上限与批次格点钳制）。阶梯、连续、批次与投运变量联合求解，
+  **不会先求连续解再取整，也不会先求解再剔除小用量，更不会跳过前档直接取后档**。
 - **成本并列**：在所有最优解中，按水源 ID 升序排列的用量向量取**字典序最小**者
   （依次最小化 z₁, z₂, …；通过一系列 MIP 精确实现，缩放系数非负故与用量向量字典序
   一致；二元启用变量不参与字典序目标，只在每一级 MIP 中受同一组结构约束支配）。
@@ -406,21 +527,24 @@ curl -X POST http://localhost:8000/api/v1/blends/1/contingency \
   `batch_size` 与 `minimum_run_volume` 可省略或为 `null`，否则必须是**有限正数**
   （拒绝 0、负数、NaN、±Infinity 与布尔值；数字字符串照常转换）；
   `minimum_active_sources` 可省略或为 `null`，否则必须是**非负整数**（拒绝负数、小数、
-  布尔值与非数字）；不满足返回 `422`。
+  布尔值与非数字）；计价必须且只能在 `cost`（有限非负数）与 `price_tiers`（非空阶梯）
+  中二选一，阶梯**非末档容量不得为 `null`**（断档）、各档容量必须为有限正数、单价必须
+  有限非负，且末档为具体数字时各档容量之和不得小于 `max_volume`；不满足返回 `422`。
 - **幂等**：以幂等键唯一索引存储；请求体（不含键本身，含各水源的 `batch_size`、
-  `minimum_run_volume` 与请求级 `minimum_active_sources`）做 SHA-256 指纹比对，防止键被
-  不同请求复用。
+  `minimum_run_volume`、`price_tiers` 与请求级 `minimum_active_sources`）做 SHA-256
+  指纹比对，防止键被不同请求复用。
 - **不可行分析**：仍返回 `status=infeasible`；可达范围用**同一个混合整数模型**计算
-  （先判定目标体积等式在批次格点与投运 / 计数约束下是否可行，不可行时改求不超过目标
-  体积的最大可达体积，再逐指标求 MIP 投影；K 无法满足时直接给出可达门槛水源数），因此
-  离散与投运约束造成的不可行与连续情形同样可解释。
+  （先判定目标体积等式在批次格点、阶梯顺序与投运 / 计数约束下是否可行，不可行时改求
+  不超过目标体积的最大可达体积，再逐指标求 MIP 投影；K 无法满足时直接给出可达门槛
+  水源数），因此离散、阶梯与投运约束造成的不可行与连续情形同样可解释。
 - **供给缩减预案**：对已保存的 `optimal` 方案，用 L1 线性化（在真实体积空间引入偏差
   变量 `d_i ≥ |x_i − x_i⁰| = |b_i·z_i − x_i⁰|`，最小化 `Σd_i`）先求最小总调整量；
-  再将其作为等式约束固定，依次求解成本最小化与字典序并列（共三级 MIP，数值不稳时以
-  紧不等式回退）。批次约束、整数性、非整除上限折算、投运门槛与 `Σy_i ≥ K` 计数全程
-  保留（缩减上限使门槛不可达的水源只能停用，计入 `available`）。预案仅根据保存的原始
-  请求与配比即时计算，**不落库、不改写原方案**；新上限下不可行时同样在混合整数可行集
-  上返回各指标可达范围与原因。未知方案 `404`，非 `optimal` 原方案或非法上限 `422`。
+  再将其作为等式约束固定，依次求解成本最小化（阶梯水源按缩减上限重算各档容量后的
+  分档边际成本）与字典序并列（共三级 MIP，数值不稳时以紧不等式回退）。批次约束、
+  整数性、非整除上限折算、阶梯顺序约束、投运门槛与 `Σy_i ≥ K` 计数全程保留
+  （缩减上限使门槛不可达的水源只能停用，计入 `available`）。预案仅根据保存的原始
+  请求与配比即时计算，**不落库、不改写原方案**；新上限下不可行时同样在混合整数
+  可行集上返回各指标可达范围与原因。未知方案 `404`，非 `optimal` 原方案或非法上限 `422`。
 
 ## 测试
 
@@ -428,21 +552,24 @@ curl -X POST http://localhost:8000/api/v1/blends/1/contingency \
 pip install -r requirements-dev.txt && pytest
 ```
 
-共 112 个用例，覆盖求解器（连续最优性、字典序并列、混合整数批次、非整除上限、
+共 152 个用例，覆盖求解器（连续最优性、字典序并列、混合整数批次、非整除上限、
 `batch_size=1` 的整数性、批次格点不可行、离散可达范围、投运门槛的 0 / ≥门槛语义、
 门槛与批次格点联立、`minimum_active_sources` 计数、门槛抬高可达区间、门槛造成的体积
-空隙、预案的最小调整 / 成本次级目标 / 字典序并列 / 批次保留 / 投运保留 / 不可行）与
-API（幂等回放 / 冲突、`batch_size` / `minimum_run_volume` / `minimum_active_sources`
-参与指纹、按 ID 查询、预案可行 / 不可行 / 校验错误、有限正数与非负整数校验、参数校验
-等）。
+空隙、**阶梯计价的按档顺序消耗 / 末档 `null` 覆盖 / 跨档批次拆账 / 后档不可越过
+未满前档 / 多档顺序 / 与批次、投运、水质区间联合优化 / 缩减上限钳制档容量**、
+预案的最小调整 / 成本次级目标 / 字典序并列 / 批次保留 / 投运保留 / 阶梯保留 /
+不可行）与 API（幂等回放 / 冲突、`batch_size` / `minimum_run_volume` /
+`minimum_active_sources` / `price_tiers` 参与指纹、按 ID 查询、预案可行 / 不可行 /
+校验错误、阶梯断档 / 非正容量 / 负单价 / 总容量不足 / 与 `cost` 互斥等校验、
+有限正数与非负整数校验、参数校验等）。
 
 ## 项目结构
 
 ```
 app/
   main.py     # FastAPI 路由与生命周期（启动时自动建库）
-  solver.py   # SciPy 混合整数规划：最低成本 + 字典序并列 + 批次/投运二元变量 + 供给缩减预案 + 不可行可达范围
-  models.py   # Pydantic 请求/响应模型与校验（batch_size/minimum_run_volume 有限正数、minimum_active_sources 非负整数校验）
+  solver.py   # SciPy 混合整数规划：最低成本 + 字典序并列 + 批次/投运二元变量 + 阶梯计价分档变量 + 供给缩减预案 + 不可行可达范围
+  models.py   # Pydantic 请求/响应模型与校验（cost/price_tiers 互斥与阶梯断档/非正容量/负单价/总容量不足校验、batch_size/minimum_run_volume 有限正数、minimum_active_sources 非负整数校验）
   db.py       # SQLite 持久化（幂等键唯一约束、原子写入）
   config.py   # 环境变量配置（DB_PATH / HOST / PORT）
 tests/        # pytest 单元与端到端测试

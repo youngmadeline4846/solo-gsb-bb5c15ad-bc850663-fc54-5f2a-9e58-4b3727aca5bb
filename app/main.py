@@ -23,7 +23,14 @@ from .models import (
     OptimalPlan,
     PlanCreateRequest,
 )
-from .solver import INDICATORS, SourceData, solve_blend, solve_contingency
+from .solver import (
+    INDICATORS,
+    SourceData,
+    source_cost,
+    solve_blend,
+    solve_contingency,
+    tier_breakdown,
+)
 
 SolveResponse = Union[OptimalPlan, InfeasiblePlan]
 ContingencyResponse = Union[ContingencyPlan, ContingencyInfeasible]
@@ -40,13 +47,15 @@ app = FastAPI(
     version="1.0.0",
     description=(
         "最低成本饮用水混配优化：在满足钙 / 镁 / 碱度区间与水源供给上限的"
-        "前提下最小化总成本；水源可设置 batch_size（批次体积），设置后用量"
-        "必须为其非负整数倍；水源还可设置 minimum_run_volume（投运门槛），"
-        "设置后其用量只能为 0 或不低于该门槛（由二元启用变量在同一 MIP 中"
-        "联立）；请求可设置 minimum_active_sources，要求至少该数量的门槛"
-        "水源投运。连续、批次与投运约束在同一个混合整数模型中求解；成本"
-        "并列时取按水源 ID 排序后用量向量字典序最小者；不可行时返回各指标"
-        "在同一混合整数可行集上的可达范围。"
+        "前提下最小化总成本；水源可二选一设置单一 cost 或 price_tiers"
+        "（阶梯计价：按顺序消耗各档容量，后一档只有前档用满才启用，最后一档"
+        "容量可为 null 覆盖至 max_volume）；水源可设置 batch_size（批次体积），"
+        "设置后用量必须为其非负整数倍；水源还可设置 minimum_run_volume"
+        "（投运门槛），设置后其用量只能为 0 或不低于该门槛（由二元启用变量在"
+        "同一 MIP 中联立）；请求可设置 minimum_active_sources，要求至少该数量"
+        "的门槛水源投运。阶梯、连续、批次与投运约束在同一个混合整数模型中"
+        "联合求解；成本并列时取按水源 ID 排序后用量向量字典序最小者；不可行时"
+        "返回各指标在同一混合整数可行集上的可达范围。"
     ),
     lifespan=lifespan,
 )
@@ -107,11 +116,32 @@ def _source_data(req: BlendRequest) -> List[SourceData]:
                 alkalinity=s.alkalinity,
                 batch_size=s.batch_size,
                 minimum_run_volume=s.minimum_run_volume,
+                price_tiers=(
+                    None if s.price_tiers is None
+                    else [(t.capacity, t.price) for t in s.price_tiers]
+                ),
             )
             for s in req.sources
         ),
         key=lambda s: s.id,
     )
+
+
+def _tier_rows(s: SourceData, volume: float,
+               cap_volume: Optional[float] = None) -> Optional[List[Dict[str, Any]]]:
+    """Per-tier usage payload for a tiered source, None for flat-cost ones."""
+    if not s.price_tiers:
+        return None
+    lines = tier_breakdown(s, volume, cap_volume)
+    return [
+        {
+            "capacity": declared_cap,
+            "price": price,
+            "volume": used,
+            "cost": cost,
+        }
+        for (declared_cap, price), (used, _unit, cost) in zip(s.price_tiers, lines)
+    ]
 
 
 def _limits_from_request(req: BlendRequest) -> Dict[str, Tuple[float, float]]:
@@ -144,7 +174,12 @@ def _build_body(sources, req: BlendRequest, result, plan_id, created_at) -> Dict
             total_volume=req.target_volume,
             total_cost=result.total_cost,
             blend=[
-                Allocation(source_id=s.id, volume=v, cost=v * s.cost)
+                Allocation(
+                    source_id=s.id,
+                    volume=v,
+                    cost=source_cost(s, float(v)),
+                    tiers=_tier_rows(s, float(v)),
+                )
                 for s, v in zip(sources, result.volumes)
             ],
             indicators=result.indicators,
@@ -181,7 +216,14 @@ def _contingency_body(
                     "new_volume": float(v),
                     "volume_delta": float(v - original[s.id]),
                     "new_cap": float(new_caps.get(s.id, s.max_volume)),
-                    "cost": float(v * s.cost),
+                    "cost": source_cost(
+                        s, float(v),
+                        cap_volume=float(new_caps.get(s.id, s.max_volume)),
+                    ),
+                    "tiers": _tier_rows(
+                        s, float(v),
+                        cap_volume=float(new_caps.get(s.id, s.max_volume)),
+                    ),
                 }
                 for s, v in zip(sources, result.volumes)
             ],
